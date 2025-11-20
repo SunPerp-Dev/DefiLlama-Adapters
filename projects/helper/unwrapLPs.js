@@ -31,7 +31,7 @@ const getPositionLiquidityAbi = 'function getPositionLiquidity(uint256 tokenId) 
 */
 async function unwrapUniswapLPs(balances, lpPositions, block, chain = 'ethereum', transformAddress = null, excludeTokensRaw = [], uni_type = 'standard',) {
   if (!transformAddress)
-    transformAddress = await getChainTransform(chain)
+    transformAddress = getChainTransform(chain)
   const api = new sdk.ChainApi({ chain, block })
   lpPositions = lpPositions.filter(i => +i.balance > 0)
   const excludeTokens = excludeTokensRaw.map(addr => addr.toLowerCase())
@@ -456,6 +456,31 @@ async function unwrapSlipstreamNFTs({ balances, nftsAndOwners = [], api, owner, 
   return balances
 }
 
+async function unwrapSlipstreamV2NFTs({ balances, nftsAndOwners = [], api, owner, nftAddress, owners, blacklistedTokens = [], whitelistedTokens = [], uniV3ExtraConfig = {} }) {
+  // https://github.com/aerodrome-finance/slipstream/blob/main/script/constants/output/DeployCL-Base-Gauge-Caps.json
+  const chain = api.chain
+  if (!nftsAndOwners.length) {
+    if (!nftAddress)
+      switch (chain) {
+        case 'base': nftAddress = '0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F'; break;
+        default: throw new Error('missing default uniswap nft address chain: ' + chain)
+      }
+
+    if ((!owners || !owners.length) && owner)
+      owners = [owner]
+    owners = getUniqueAddresses(owners, chain)
+    if (Array.isArray(nftAddress))
+      nftsAndOwners = nftAddress.map(nft => owners.map(o => [nft, o])).flat()
+    else
+      nftsAndOwners = owners.map(o => [nftAddress, o])
+  }
+  const positionIdsByNftAddress = await getPositionIdsByNftAddress({ api, nftsAndOwners, })
+  for (const [nftAddress, positionIds] of Object.entries(positionIdsByNftAddress)) {
+    await unwrapSlipstreamNFT({ balances, positionIds, nftAddress, api, blacklistedTokens, whitelistedTokens, uniV3ExtraConfig, })
+  }
+  return balances
+}
+
 async function getPositionIdsByNftAddress({ api, nftsAndOwners, }) {
   const ownersByNFT = {}
   nftsAndOwners.forEach(([nftAddress, owner]) => {
@@ -578,7 +603,7 @@ tokensAndOwners [
 */
 async function sumTokens(balances = {}, tokensAndOwners, block, chain = "ethereum", transformAddress, { resolveLP = false, unwrapAll = false, blacklistedLPs = [], skipFixBalances = false, abis = {}, permitFailure = false, sumChunkSize = undefined, sumChunkSleep = 3000 } = {}) {
   if (!transformAddress)
-    transformAddress = await getChainTransform(chain)
+    transformAddress = getChainTransform(chain)
 
   let ethBalanceInputs = []
 
@@ -662,7 +687,7 @@ async function sumTokens(balances = {}, tokensAndOwners, block, chain = "ethereu
     await unwrapLPsAuto({ balances, block, chain, transformAddress, blacklistedLPs, abis })
 
   if (!skipFixBalances && ['astar', 'harmony', 'kava', 'thundercore', 'klaytn', 'evmos'].includes(chain)) {
-    const fixBalances = await getFixBalances(chain)
+    const fixBalances = getFixBalances(chain)
     fixBalances(balances)
   }
 
@@ -723,7 +748,7 @@ async function unwrapLPsAuto({ api, balances, block, chain = "ethereum", transfo
   }
 
   if (!transformAddress)
-    transformAddress = await getChainTransform(chain)
+    transformAddress = getChainTransform(chain)
 
   pool2Tokens = pool2Tokens.map(token => token.toLowerCase())
   blacklistedLPs = blacklistedLPs.map(token => token.toLowerCase())
@@ -844,6 +869,7 @@ async function sumTokens2({
   resolveUniV3 = false,
   resolveUniV4 = false,
   resolveSlipstream = false,
+  resolveSlipstreamV2 = false,
   uniV3WhitelistedTokens = [],
   uniV3nftsAndOwners = [],
   resolveArtBlocks = false,
@@ -985,6 +1011,9 @@ group by
   if (resolveSlipstream)
     await unwrapSlipstreamNFTs({ balances, api, owner, owners, blacklistedTokens, whitelistedTokens: uniV3WhitelistedTokens, nftsAndOwners: uniV3nftsAndOwners, uniV3ExtraConfig, })
 
+  if (resolveSlipstreamV2)
+    await unwrapSlipstreamV2NFTs({ balances, api, owner, owners, blacklistedTokens, whitelistedTokens: uniV3WhitelistedTokens, nftsAndOwners: uniV3nftsAndOwners, uniV3ExtraConfig, })
+
   blacklistedTokens = blacklistedTokens.map(t => normalizeAddress(t, chain))
   tokensAndOwners = tokensAndOwners.map(([t, o]) => [normalizeAddress(t, chain), o]).filter(([token]) => !blacklistedTokens.includes(token))
   tokensAndOwners = getUniqueToA(tokensAndOwners)
@@ -1004,8 +1033,20 @@ group by
 
 
   if (!skipFixBalances) {
-    const fixBalances = await getFixBalances(chain)
+    const fixBalances = getFixBalances(chain)
     fixBalances(balances)
+  }
+
+
+  // we current dont have mapping or price support for hex address format (0x...) of tron tokens so we convert them to T... format
+  if (api.chain === 'tron') {
+    Object.entries(balances).forEach(([token, value]) => {
+      if (token.includes(nullAddress)) return;
+      if (!token.startsWith('tron:0x')) return;
+      delete balances[token]
+      const tronToken = sdk.util.evmToTronAddress(token.split(':')[1])
+      sdk.util.sumSingleBalance(balances, tronToken, value, chain)
+    })
   }
 
   return balances
@@ -1048,11 +1089,12 @@ async function unwrapHypervisorVaults({ api, lps }) {
     api.removeTokenBalance(lpToken)
   })
 
+
   return api.getBalances()
 }
 
-function sumTokensExport({ balances, tokensAndOwners, tokensAndOwners2, tokens, owner, owners, transformAddress, unwrapAll, resolveLP, blacklistedLPs, blacklistedTokens, skipFixBalances, ownerTokens, resolveUniV3, resolveUniV4, resolveSlipstream, resolveArtBlocks, resolveNFTs, fetchCoValentTokens, logCalls, ...args }) {
-  return async (api) => sumTokens2({ api, balances, tokensAndOwners, tokensAndOwners2, tokens, owner, owners, transformAddress, unwrapAll, resolveLP, blacklistedLPs, blacklistedTokens, skipFixBalances, ownerTokens, resolveUniV3, resolveUniV4, resolveSlipstream, resolveArtBlocks, resolveNFTs, fetchCoValentTokens, ...args, })
+function sumTokensExport({ balances, tokensAndOwners, tokensAndOwners2, tokens, owner, owners, transformAddress, unwrapAll, resolveLP, blacklistedLPs, blacklistedTokens, skipFixBalances, ownerTokens, resolveUniV3, resolveUniV4, resolveSlipstream, resolveSlipstreamV2, resolveArtBlocks, resolveNFTs, fetchCoValentTokens, logCalls, ...args }) {
+  return async (api) => sumTokens2({ api, balances, tokensAndOwners, tokensAndOwners2, tokens, owner, owners, transformAddress, unwrapAll, resolveLP, blacklistedLPs, blacklistedTokens, skipFixBalances, ownerTokens, resolveUniV3, resolveUniV4, resolveSlipstream, resolveSlipstreamV2, resolveArtBlocks, resolveNFTs, fetchCoValentTokens, ...args, })
 }
 
 async function unwrapAuraPool({ api, chain, block, auraPool, owner, balances, isBPool = false, isV2 = true }) {
